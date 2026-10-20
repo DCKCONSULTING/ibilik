@@ -1,0 +1,7 @@
+
+# Private uploads and payment documents
+backend/media/
+
+backend/media/
+.env
+.env.*

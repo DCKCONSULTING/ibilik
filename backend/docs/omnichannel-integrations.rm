@@ -1,0 +1,486 @@
+# iBilik CRM Omnichannel Ingest
+
+This file uses Markdown. The repository had no existing `.rm` documentation
+convention, so the requested `.rm` extension is used with standard Markdown
+content rather than a proprietary format.
+
+Website forms, WhatsApp, and Facebook Messenger all enter the same customer,
+conversation, and message engine. There is one customer record per person and
+one inbox.
+
+```
+Website  -->
+WhatsApp -->  Customer -> Conversation -> Message
+Facebook -->
+```
+
+Base URL in local development: `http://127.0.0.1:8000`
+
+# Shared concepts
+
+## Channels
+
+| Value      | Meaning              | Inbound | Outbound                         |
+| ---------- | -------------------- | ------- | -------------------------------- |
+| `website`  | Website form         | yes     | no                               |
+| `whatsapp` | WhatsApp             | yes     | yes, if a phone/WhatsApp identity exists and the adapter is configured |
+| `facebook` | Facebook Messenger   | yes     | yes, if a Messenger PSID exists and the adapter is configured |
+
+## Customer matching
+
+Incoming events resolve to one customer in this order:
+
+1. Existing `CustomerChannelIdentity` (`channel` + `identifier_type` + `identifier`)
+2. Normalized phone
+3. Normalized email
+4. Create a new customer
+
+Names are never used to merge customers.
+
+Phone numbers are normalized to `+` plus digits. Emails are lowercased.
+
+A website form that includes a phone number stores that phone on the customer
+and as a website identity. It does **not** invent a WhatsApp identity. WhatsApp
+replies are offered only when the WhatsApp adapter can legitimately send to
+that phone (provider configured or `WHATSAPP_PROVIDER=test`).
+
+## Idempotency
+
+If `external_message_id` (website: `external_id`) is present, the CRM stores at
+most one message per `(channel, external_message_id)`.
+
+Duplicate events return HTTP 200 with `"deduplicated": true` and the original
+records. New events return HTTP 201.
+
+## Property access
+
+`property_id` is stored only when the payload identifies a real property. The
+CRM does not guess.
+
+- Superuser: all conversations
+- Global property access: all conversations
+- Assigned users: only conversations whose property they can access
+- Conversations with no property are hidden from assigned users
+
+Django enforces this. Frontend filters are not a security boundary.
+
+## Secrets
+
+Never send access tokens, webhook secrets, or passwords in customer payloads.
+If they appear, they are redacted to `[redacted]` before raw event storage.
+
+Do not commit production values. Configure them in the environment.
+
+| Variable | Purpose |
+| -------- | ------- |
+| `WEBSITE_INGEST_API_KEY` | Shared ingest key for `/messages/` endpoints |
+| `WHATSAPP_INGEST_API_KEY` | Optional override; falls back to `WEBSITE_INGEST_API_KEY` |
+| `FACEBOOK_INGEST_API_KEY` | Optional override; falls back to `WEBSITE_INGEST_API_KEY` |
+| `WHATSAPP_VERIFY_TOKEN` | Meta webhook subscription token |
+| `WHATSAPP_APP_SECRET` | HMAC-SHA256 for WhatsApp webhooks (`X-Hub-Signature-256`) |
+| `WHATSAPP_ACCESS_TOKEN` | Outbound WhatsApp Cloud API token |
+| `WHATSAPP_PHONE_NUMBER_ID` | Outbound WhatsApp Cloud API phone number id |
+| `WHATSAPP_PROVIDER` | `meta` (default) or `test` |
+| `FACEBOOK_VERIFY_TOKEN` | Meta webhook subscription token |
+| `FACEBOOK_APP_SECRET` | HMAC-SHA256 for Facebook webhooks |
+| `FACEBOOK_ACCESS_TOKEN` | Outbound Messenger token |
+| `FACEBOOK_PAGE_ID` | Page id, if the chosen provider needs it |
+| `FACEBOOK_PROVIDER` | `meta` (default) or `test` |
+
+# Authentication
+
+Staff APIs (`/api/customers/`, `/api/conversations/`) use the existing Django
+session cookie plus `X-CSRFToken`.
+
+Ingest APIs do not use session auth.
+
+- `/api/integrations/*/messages/` require `X-API-Key: <ingest key>`
+  or `Authorization: Bearer <ingest key>`
+- `/api/integrations/whatsapp/webhook/` and `/api/integrations/facebook/webhook/`
+  require Meta webhook verification
+
+Unsigned webhook POSTs are rejected. Empty secrets are not treated as “open”.
+Local testing must set the variables above.
+
+# Website form
+
+## Endpoint
+
+`POST /api/integrations/website/messages/`
+
+## Headers
+
+```
+Content-Type: application/json
+X-API-Key: <WEBSITE_INGEST_API_KEY>
+```
+
+## Required fields
+
+- `name`
+- `message` (or `content`)
+- `email` or `phone`
+
+## Optional fields
+
+- `email`
+- `phone`
+- `source` (informational)
+- `source_reference`
+- `external_id` / `external_message_id` (idempotency)
+- `external_conversation_id`
+- `property_id`
+- `timestamp`
+- `attachments` (metadata only: `type`, `url`, `mime_type`, `filename`, `size`)
+
+## Example request
+
+```http
+POST /api/integrations/website/messages/
+Content-Type: application/json
+X-API-Key: change-me-local-ingest-key
+```
+
+```json
+{
+  "name": "John Smith",
+  "email": "john@example.com",
+  "phone": "+201001234567",
+  "message": "I need a room",
+  "source": "website",
+  "source_reference": "website-form",
+  "external_id": "web-123",
+  "property_id": 1
+}
+```
+
+## Example response `201`
+
+```json
+{
+  "deduplicated": false,
+  "customer": {
+    "id": 1,
+    "name": "John Smith",
+    "email": "john@example.com",
+    "phone": "+201001234567",
+    "status": "active",
+    "sources": ["website"],
+    "reply_channels": []
+  },
+  "conversation": {
+    "id": 1,
+    "channel": "website",
+    "status": "open"
+  },
+  "message": {
+    "id": 1,
+    "channel": "website",
+    "direction": "inbound",
+    "content": "I need a room",
+    "external_message_id": "web-123",
+    "status": "received"
+  }
+}
+```
+
+A repeated `external_id` returns HTTP 200 and `"deduplicated": true`.
+
+## Errors
+
+| Status | Code | When |
+| ------ | ---- | ---- |
+| 401 | `invalid_api_key` | Missing or wrong API key |
+| 503 | `ingest_not_configured` | `WEBSITE_INGEST_API_KEY` is empty |
+| 400 | `invalid_payload` | Missing name, message, or contact |
+| 400 | `unknown_property` | `property_id` does not exist |
+
+# WhatsApp webhook
+
+## Verification
+
+```
+GET /api/integrations/whatsapp/webhook/?hub.mode=subscribe&hub.verify_token=<WHATSAPP_VERIFY_TOKEN>&hub.challenge=abc
+```
+
+Success: HTTP 200 and the raw `hub.challenge` body.
+
+## Inbound events
+
+`POST /api/integrations/whatsapp/webhook/`
+
+### Headers
+
+```
+Content-Type: application/json
+X-Hub-Signature-256: sha256=<hex hmac of raw body using WHATSAPP_APP_SECRET>
+```
+
+The adapter accepts Meta Cloud API envelopes and a simplified CRM payload.
+
+### Meta example
+
+```json
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "entry-1",
+      "changes": [
+        {
+          "value": {
+            "contacts": [{"profile": {"name": "John Smith"}, "wa_id": "201001234567"}],
+            "messages": [
+              {
+                "id": "wamid.1",
+                "from": "201001234567",
+                "timestamp": "1710000000",
+                "type": "text",
+                "text": {"body": "Hello, I need more information."}
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Simplified example (same webhook, still signed)
+
+```json
+{
+  "from": "+201001234567",
+  "name": "John Smith",
+  "content": "Hello, I need more information.",
+  "external_message_id": "wamid.1",
+  "external_conversation_id": "wa-john",
+  "sender_type": "customer",
+  "timestamp": "2026-09-06T10:00:00Z"
+}
+```
+
+`sender_type` may be `customer`, `bot`, `staff`, or `system` when the source
+system provides it. Do not invent a sender type if it is unknown; the default
+is `customer`.
+
+Stored fields include channel, external message/conversation ids, sender and
+recipient identifiers, timestamp, content, attachment metadata, and a sanitized
+raw event.
+
+## Normalized WhatsApp ingest
+
+For middleware or local CRM-pipeline tests that are not Meta webhooks:
+
+`POST /api/integrations/whatsapp/messages/`
+
+```
+X-API-Key: <WHATSAPP_INGEST_API_KEY or WEBSITE_INGEST_API_KEY>
+```
+
+This uses the same customer engine. It does not skip matching or idempotency.
+
+# Facebook Messenger webhook
+
+## Verification
+
+```
+GET /api/integrations/facebook/webhook/?hub.mode=subscribe&hub.verify_token=<FACEBOOK_VERIFY_TOKEN>&hub.challenge=abc
+```
+
+## Inbound events
+
+`POST /api/integrations/facebook/webhook/`
+
+```
+X-Hub-Signature-256: sha256=<hex hmac of raw body using FACEBOOK_APP_SECRET>
+```
+
+### Meta example
+
+```json
+{
+  "object": "page",
+  "entry": [
+    {
+      "id": "page-1",
+      "messaging": [
+        {
+          "sender": {"id": "psid-1"},
+          "recipient": {"id": "page-1"},
+          "timestamp": 1710000000000,
+          "message": {"mid": "mid.1", "text": "Is this hotel available next weekend?"}
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Simplified example (signed webhook or API-key `/messages/` endpoint)
+
+```json
+{
+  "sender_id": "psid-1",
+  "recipient_id": "page-1",
+  "name": "John Smith",
+  "phone": "+201001234567",
+  "email": "john@example.com",
+  "content": "Is this hotel available next weekend?",
+  "external_message_id": "mid.1"
+}
+```
+
+Optional `phone` / `email` are matching hints only. A Facebook PSID alone
+creates or matches a Facebook identity. A known phone/email attaches the PSID
+to the existing customer.
+
+`POST /api/integrations/facebook/messages/` uses the ingest API key and the
+same parser.
+
+# Staff APIs
+
+Session authentication required.
+
+## Customers
+
+```
+GET  /api/customers/?search=&status=&channel=&property=&page=&page_size=
+POST /api/customers/
+GET  /api/customers/{id}/
+PATCH /api/customers/{id}/
+```
+
+`POST` body:
+
+```json
+{
+  "name": "Ada Lovelace",
+  "email": "ada@example.com",
+  "phone": "+201009998887",
+  "status": "lead",
+  "notes": "",
+  "property_id": 1
+}
+```
+
+Permissions: `customers.view_customer`, `customers.add_customer`,
+`customers.change_customer`.
+
+## Conversations
+
+```
+GET /api/conversations/?channel=whatsapp&customer=1&property=1&status=open&search=John&unread=true&page=1&page_size=20
+GET /api/conversations/{id}/
+GET /api/inbox/
+```
+
+`/api/inbox/` is the same list as `/api/conversations/`.
+
+Filtering is performed in Django.
+
+## Messages
+
+```
+GET  /api/conversations/{id}/messages/?page=1&page_size=50&channel=whatsapp
+POST /api/conversations/{id}/messages/
+POST /api/conversations/{id}/read/
+```
+
+Message pages are newest-first for pagination, then reversed so `results` are
+chronological. Use `page=2` for older WhatsApp history.
+
+## Reply
+
+```
+POST /api/conversations/{id}/messages/
+X-CSRFToken: <csrf>
+```
+
+```json
+{
+  "content": "Hello, thank you for contacting us.",
+  "channel": "whatsapp"
+}
+```
+
+Permission: `inbox.send_message`.
+
+Rules:
+
+- `channel` is the reply channel, not a rewrite of the conversation source
+- Website conversations stay `channel=website`
+- The outbound message is stored with `channel=whatsapp` or `channel=facebook`
+- Website cannot be used as a reply channel
+- WhatsApp requires a reachable phone / WhatsApp identity and a configured adapter
+- Facebook requires a Messenger identity and a configured adapter
+
+If the provider is not configured, the CRM stores the outbound message as
+`failed`. It does not pretend delivery succeeded.
+
+`WHATSAPP_PROVIDER=test` or `FACEBOOK_PROVIDER=test` records a local send for
+automated tests only. That is not production delivery.
+
+# Demo data
+
+```
+python manage.py seed_demo_data
+```
+
+Idempotent. Creates only demo-prefixed conversations/messages and fictional
+customers. It does not flush the database.
+
+Development users, created if missing (password is not overwritten):
+
+```
+admin_demo     DemoPass123!   SUPERUSER
+manager_cairo  DemoPass123!   Cairo only
+staff_cairo    DemoPass123!   Cairo only
+global_staff   DemoPass123!   all properties
+```
+
+These passwords are for local development only.
+
+# Local development
+
+1. Copy `backend/.env.example` and set `WEBSITE_INGEST_API_KEY`.
+2. For webhook signature tests, set `WHATSAPP_APP_SECRET` / `FACEBOOK_APP_SECRET`
+   and sign the raw body:
+
+```
+sha256 = HMAC_SHA256(app_secret, raw_request_body)
+header = "sha256=" + hex(sha256)
+```
+
+3. Website and `/messages/` ingest can be tested with the API key alone.
+4. Actual WhatsApp / Facebook delivery requires provider tokens.
+
+| What | Local without provider tokens |
+| ---- | ----------------------------- |
+| Customer matching | CRM pipeline tested |
+| Conversation / message storage | CRM pipeline tested |
+| Idempotent webhooks | Tested when secrets and signatures are set |
+| Provider delivery | Not tested — outbound status is `failed` unless `*_PROVIDER=test` |
+
+Example local website ingest:
+
+```
+curl -X POST http://127.0.0.1:8000/api/integrations/website/messages/ ^
+  -H "Content-Type: application/json" ^
+  -H "X-API-Key: change-me-local-ingest-key" ^
+  -d "{\"name\":\"John Smith\",\"phone\":\"+201001234567\",\"email\":\"john@example.com\",\"message\":\"I need a room\",\"external_id\":\"web-123\"}"
+```
+
+# Error shape
+
+All JSON errors use the existing CRM format:
+
+```json
+{
+  "message": "Invalid ingest credentials.",
+  "code": "invalid_api_key"
+}
+```
+
+Provider tokens are never included in error bodies.
